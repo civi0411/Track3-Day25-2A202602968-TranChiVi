@@ -1,17 +1,10 @@
 """Part D — Exactly-once *effects* for an agent workflow.
 
-Two ingredients, and you need both:
+Two essential ingredients:
+1. Idempotency keys: deterministic, derived from (session_id, step)
+2. Durable Checkpoints: committed immediately AFTER step completion
 
-1. **Idempotency keys** — a retry (or a re-run after a crash) of a side effect
-   must reuse the *same* key, so the payment provider de-duplicates it.
-   The key must be derived from *what* you are doing (session + step), never
-   random per attempt.
-2. **Checkpoints** — after each step succeeds, persist its result in the
-   DurableStore. A fresh worker resumes from the last checkpoint instead of
-   redoing (and re-paying for) everything.
-
-Think hard about the ORDER of "execute step" and "save checkpoint".
-Never catch ``WorkerCrash`` — it means this process is dead.
+Never catch WorkerCrash — it simulates process termination.
 
 Tests: tests/test_executor.py, then `make workflows`.
 """
@@ -21,21 +14,20 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from gameday_lab.workflows.runner import STEPS, RefundRequest  # noqa: F401  (STEPS: use it in run())
-from gameday_lab.workflows.services import DurableStore, ServiceError, Services, ServiceTimeout  # noqa: F401
+from gameday_lab.workflows.runner import STEPS, RefundRequest
+from gameday_lab.workflows.services import DurableStore, ServiceError, Services, ServiceTimeout
 
 T = TypeVar("T")
 
 
 def idempotency_key(req: RefundRequest, step: str) -> str:
-    """TODO(student): a key that is identical for every retry / restart of the same
-    side effect of the same session, and different across sessions and steps."""
-    raise NotImplementedError("TODO(student): idempotency_key()")
+    """Deterministic idempotency key specific to session and step."""
+    return f"{req.session_id}:{step}"
 
 
 def checkpoint_key(req: RefundRequest, step: str) -> str:
-    """TODO(student): DurableStore key under which the result of ``step`` is saved."""
-    raise NotImplementedError("TODO(student): checkpoint_key()")
+    """Storage key for step checkpoint in DurableStore."""
+    return f"checkpoint:{req.session_id}:{step}"
 
 
 class WorkflowExecutor:
@@ -44,35 +36,65 @@ class WorkflowExecutor:
         self.store = store
         self.max_attempts = max_attempts
 
-    def _retry(self, fn: Callable[[], T]) -> T:
-        """TODO(student): call fn(); retry on ServiceError / ServiceTimeout up to
-        ``max_attempts`` times (re-raise the last one). Never catch WorkerCrash."""
-        raise NotImplementedError("TODO(student): _retry()")
+    def _retry(self, operation: Callable[[], T]) -> T:
+        """Execute operation with retry on transient network errors.
+
+        Retries ServiceError and ServiceTimeout up to max_attempts times.
+        Never catches WorkerCrash.
+        """
+        last_error: Exception | None = None
+        for _ in range(self.max_attempts):
+            try:
+                return operation()
+            except (ServiceError, ServiceTimeout) as err:
+                last_error = err
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No attempts executed")
 
     def _step(self, req: RefundRequest, state: dict[str, Any], step: str) -> Any:
-        """PROVIDED: execute one step. ``state`` holds results of earlier steps."""
+        """Execute individual workflow step."""
         if step == "classify_request":
             return self._retry(lambda: self.s.llm.classify(req.order_id, req.amount_cents))
+
         if step == "lookup_order":
-            return self._retry(lambda: self.s.orders.get(state["classify_request"]["order_id"]))
+            order_id = state["classify_request"]["order_id"]
+            return self._retry(lambda: self.s.orders.get(order_id))
+
         if step == "issue_refund":
-            key = idempotency_key(req, step)
-            return self._retry(lambda: self.s.payments.refund(req.order_id, req.amount_cents, idempotency_key=key))
+            idemp_key = idempotency_key(req, step)
+            return self._retry(lambda: self.s.payments.refund(req.order_id, req.amount_cents, idempotency_key=idemp_key))
+
         if step == "send_email":
-            key = idempotency_key(req, step)
-            data = {"refund_id": state["issue_refund"]["refund_id"]}
-            return self._retry(lambda: self.s.email.send(req.customer_email, "refund_done", data, idempotency_key=key))
+            idemp_key = idempotency_key(req, step)
+            email_payload = {"refund_id": state["issue_refund"]["refund_id"]}
+            return self._retry(
+                lambda: self.s.email.send(req.customer_email, "refund_done", email_payload, idempotency_key=idemp_key)
+            )
+
         if step == "write_summary":
-            return self._retry(lambda: self.s.llm.summarize(state["issue_refund"]["refund_id"],
-                                                            state["send_email"]["message_id"]))
-        raise ValueError(step)
+            ref_id = state["issue_refund"]["refund_id"]
+            msg_id = state["send_email"]["message_id"]
+            return self._retry(lambda: self.s.llm.summarize(ref_id, msg_id))
+
+        raise ValueError(f"Unknown step: {step}")
 
     def run(self, req: RefundRequest) -> dict[str, Any]:
-        """TODO(student): run every step in STEPS for ``req``.
+        """Execute refund workflow exactly once across worker restarts."""
+        state: dict[str, Any] = {}
 
-        * a step whose checkpoint already exists in ``self.store`` was done by a
-          previous (crashed) worker: load its result into ``state`` and skip it
-        * otherwise execute it with ``self._step`` and checkpoint the result
-        * return {"status": "done", **state}
-        """
-        raise NotImplementedError("TODO(student): run()")
+        for step in STEPS:
+            ckey = checkpoint_key(req, step)
+            saved_result = self.store.get(ckey)
+
+            if saved_result is not None:
+                # Step was already completed by previous worker: resume from checkpoint
+                state[step] = saved_result
+            else:
+                # Step not yet done: execute, then checkpoint atomically
+                step_result = self._step(req, state, step)
+                self.store.put(ckey, step_result)
+                state[step] = step_result
+
+        return {"status": "done", **state}
