@@ -28,11 +28,11 @@ fallback_order: [alpha, alpha-eu, beta, gamma-mini]
 # YOUR client settings (read by ResilientClient). Tune them, explain them.
 # ----------------------------------------------------------------------------
 client:
-  attempt_timeout_s: 8.0
+  attempt_timeout_s: 7.5
   max_attempts_per_provider: 2      # 1 retry on the same provider, then fail over
   min_time_left_s: 1.0              # don't start an attempt that cannot finish
-  backoff_base_s: 0.25
-  backoff_cap_s: 4.0
+  backoff_base_s: 0.2
+  backoff_cap_s: 3.5
   retry_budget_ratio: 0.1           # retries <= ~10% of first attempts
   retry_budget_min_per_s: 0.5
   retry_budget_max_tokens: 20
@@ -41,9 +41,9 @@ client:
     window_size: 20
     min_calls: 10
     failure_rate_threshold: 0.5
-    slow_call_s: 5.0
-    slow_rate_threshold: 0.6
-    open_duration_s: 10.0
+    slow_call_s: 4.8
+    slow_rate_threshold: 0.55
+    open_duration_s: 9.0
     half_open_max_probes: 2
     half_open_successes: 2
 
@@ -53,7 +53,7 @@ client:
 # wrong_answers_by_reason, tune each value and justify it in report section 8.
 # ----------------------------------------------------------------------------
 cache:
-  similarity_threshold: 0.80
-  ttl_s: 600
-  max_stale_s: 0
+  similarity_threshold: 0.91
+  ttl_s: 50
+  max_stale_s: 300
   max_entries: 500
