@@ -4,4 +4,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+uv.lock
+.DS_Store
 # reports/ is part of the submission (scoreboard.json, REPORT.md, figures, time-series CSVs) — keep it tracked
