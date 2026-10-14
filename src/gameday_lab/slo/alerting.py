@@ -26,7 +26,7 @@ class AlertRule:
     burn_rate: float
 
 
-# SRE Workbook defaults for a 30-day SLO window
+# SRE Workbook standard alerting rules for a 30-day (43,200 min) SLO window
 DEFAULT_RULES: tuple[AlertRule, ...] = (
     AlertRule("fast_burn_2pct_1h", "page", 60, 5, 14.4),
     AlertRule("slow_burn_5pct_6h", "page", 360, 30, 6.0),
@@ -38,58 +38,101 @@ DEFAULT_RULES: tuple[AlertRule, ...] = (
 class AlertEvent:
     rule: str
     severity: str
-    start_min: int  # first minute the rule fired
-    end_min: int  # first minute it stopped firing (exclusive)
+    start_min: int  # first minute rule fired
+    end_min: int  # first minute rule stopped firing (exclusive)
 
 
 class WindowSums:
-    """O(1) sum of any window, via prefix sums. Build once, query many times.
-
-    43,200 minutes x 6 windows: recomputing every window with sum() is far too slow.
-    """
+    """O(1) prefix sum data structure for rolling window aggregations."""
 
     def __init__(self, values: list[int]) -> None:
-        """TODO(student): build the prefix-sum list (prefix[0] = 0)."""
-        raise NotImplementedError("TODO(student): WindowSums.__init__()")
+        """Construct cumulative prefix sum array."""
+        self._prefix = [0]
+        accum = 0
+        for val in values:
+            accum += val
+            self._prefix.append(accum)
+        self._len = len(values)
 
     def sum(self, end_inclusive: int, length: int) -> int:
-        """TODO(student): sum of values[end_inclusive - length + 1 .. end_inclusive],
-        clipped at index 0 when the window starts before the data."""
-        raise NotImplementedError("TODO(student): WindowSums.sum()")
+        """Calculate sum of slice ending at end_inclusive of specified length."""
+        if self._len == 0:
+            return 0
+
+        bounded_end = min(end_inclusive, self._len - 1)
+        if bounded_end < 0:
+            return 0
+
+        bounded_start = max(0, end_inclusive - length + 1)
+        if bounded_start > bounded_end:
+            return 0
+
+        return self._prefix[bounded_end + 1] - self._prefix[bounded_start]
 
 
 class BurnRateAlerter:
     def __init__(self, slo: float = 0.995, rules: tuple[AlertRule, ...] = DEFAULT_RULES) -> None:
-        if not 0 < slo < 1:
-            raise ValueError("slo must be in (0, 1)")
+        if not (0.0 < slo < 1.0):
+            raise ValueError("slo must be between 0 and 1 exclusive")
         self.slo = slo
         self.rules = rules
 
     def burn_rate(self, total: WindowSums, bad: WindowSums, end: int, length: int) -> float:
-        """TODO(student): (bad / total over the window) / (1 - slo); 0.0 if total is 0."""
-        raise NotImplementedError("TODO(student): burn_rate()")
+        """Calculate burn rate factor normalized by (1 - SLO)."""
+        tot_count = total.sum(end, length)
+        if tot_count == 0:
+            return 0.0
+        error_rate = bad.sum(end, length) / tot_count
+        return error_rate / (1.0 - self.slo)
 
     def evaluate(self, total: list[int], bad: list[int]) -> list[AlertEvent]:
-        """TODO(student): one AlertEvent per contiguous firing episode of each rule.
+        """Detect firing alert episodes using dual-window burn rate conditions."""
+        total_sums = WindowSums(total)
+        bad_sums = WindowSums(bad)
+        num_minutes = len(total)
+        events: list[AlertEvent] = []
 
-        For each rule, scan the minutes; the rule fires at minute i when
-        burn(long) >= rule.burn_rate AND burn(short) >= rule.burn_rate.
-        An episode starts at the first firing minute and ends (exclusive) at the
-        first minute it stops firing (or len(total)). Sort by start_min.
-        """
-        raise NotImplementedError("TODO(student): evaluate()")
+        for rule in self.rules:
+            active_episode_start: int | None = None
+
+            for minute_idx in range(num_minutes):
+                long_br = self.burn_rate(total_sums, bad_sums, minute_idx, rule.long_min)
+                short_br = self.burn_rate(total_sums, bad_sums, minute_idx, rule.short_min)
+
+                is_firing = (long_br >= rule.burn_rate) and (short_br >= rule.burn_rate)
+
+                if is_firing:
+                    if active_episode_start is None:
+                        active_episode_start = minute_idx
+                else:
+                    if active_episode_start is not None:
+                        events.append(AlertEvent(rule.name, rule.severity, active_episode_start, minute_idx))
+                        active_episode_start = None
+
+            if active_episode_start is not None:
+                events.append(AlertEvent(rule.name, rule.severity, active_episode_start, num_minutes))
+
+        events.sort(key=lambda ev: (ev.start_min, ev.rule))
+        return events
 
 
 def error_budget_report(total: list[int], bad: list[int], slo: float = 0.995) -> dict[str, float | bool]:
-    """TODO(student): how much of the 30-day error budget is spent?
+    """Calculate 30-day error budget consumption and release freeze recommendation."""
+    total_reqs = sum(total)
+    allowed_bad = round((1.0 - slo) * total_reqs, 1)
+    actual_bad = sum(bad)
 
-    Return a dict with:
-      requests          sum(total)
-      allowed_bad       (1 - slo) * requests            (round to 1 decimal)
-      bad               sum(bad)
-      availability      1 - bad / requests              (round to 6 decimals)
-      budget_consumed   bad / allowed_bad               (round to 4 decimals)
-      budget_remaining  1 - budget_consumed             (round to 4 decimals)
-      freeze_releases   True when nothing is left (budget_remaining <= 0)
-    """
-    raise NotImplementedError("TODO(student): error_budget_report()")
+    availability = round(1.0 - (actual_bad / total_reqs), 6) if total_reqs > 0 else 1.0
+    budget_consumed = round(actual_bad / allowed_bad, 4) if allowed_bad > 0 else 0.0
+    budget_remaining = round(1.0 - budget_consumed, 4)
+    freeze_releases = budget_remaining <= 0.0
+
+    return {
+        "requests": total_reqs,
+        "allowed_bad": allowed_bad,
+        "bad": actual_bad,
+        "availability": availability,
+        "budget_consumed": budget_consumed,
+        "budget_remaining": budget_remaining,
+        "freeze_releases": freeze_releases,
+    }
